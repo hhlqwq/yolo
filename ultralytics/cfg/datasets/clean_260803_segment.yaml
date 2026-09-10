@@ -1,0 +1,27 @@
+# Train/val/test sets as 1) dir: path/to/imgs, 2) file: path/to/imgs.txt, or 3) list: [path/to/imgs1, path/to/imgs2, ..]
+# 使用列表指定多个路径
+path: /data/users/hailong.he/nas_smb/Docs_Internal/知识库(钉钉同构)/算法工具链/算法应用（主）/应用场景/【舜宇】清洁机器人/DEMO开发/数据采集/DATA/
+
+train:
+  - 02_相似工业场景/previous/shunyu260717/train/images/
+  - 02_相似工业场景/previous/zicai260720/train/images/
+  - 02_相似工业场景/previous/zicai260721/train/images/
+  - 02_相似工业场景/previous/zicai260721/train_neg/images/
+  - 02_相似工业场景/previous/meta_ai_260724/train/images/
+  - 02_相似工业场景/previous/zicai260730/05_1_paper/
+  - 02_相似工业场景/【何海龙】【20260728】【楼下会议室】/train/train/images/
+
+val:
+  - 02_相似工业场景/previous/shunyu260717/val/images/
+  - 02_相似工业场景/previous/zicai260720/val/images/
+  - 02_相似工业场景/previous/zicai260721/val/images/
+  - 02_相似工业场景/【何海龙】【20260728】【楼下会议室】/train/val/images/
+
+labels_dir: labels_segment
+
+# 类别数量
+nc: 1
+
+# 类别名称
+names:
+  0: paper

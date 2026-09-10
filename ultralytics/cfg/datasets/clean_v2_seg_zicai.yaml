@@ -1,0 +1,18 @@
+# Train/val/test sets as 1) dir: path/to/imgs, 2) file: path/to/imgs.txt, or 3) list: [path/to/imgs1, path/to/imgs2, ..]
+# 使用列表指定多个路径
+train:
+  - /data/users/hailong.he/datasets/clean/zicai260720/train/images/
+  - /data/users/hailong.he/datasets/clean/shunyu260717/train/images/
+  
+
+val:
+  - /data/users/hailong.he/datasets/clean/zicai260720/val/images/
+  # - /data/users/hailong.he/datasets/clean/shunyu260717/val/images/
+
+# 类别数量
+nc: 1
+
+# 类别名称
+names:
+  0: paper
+

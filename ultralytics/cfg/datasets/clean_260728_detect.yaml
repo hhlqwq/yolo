@@ -1,0 +1,27 @@
+# Train/val/test sets as 1) dir: path/to/imgs, 2) file: path/to/imgs.txt, or 3) list: [path/to/imgs1, path/to/imgs2, ..]
+# 使用列表指定多个路径
+path: /data/users/hailong.he/datasets/opc_clean/
+
+train:
+  - shunyu260717/train/images/
+  - zicai260720/train/images/
+  - zicai260721/train/images/
+  - zicai260721/train_neg/images/
+  - meta_ai_260724/train/images/
+
+val:
+  - shunyu260717/val/images/
+  - zicai260720/val/images/
+  - zicai260721/val/images/
+
+labels_dir: labels_detect
+
+# 类别数量
+nc: 3
+
+# 类别名称
+names:
+  0: paper
+  1: liquid
+  2: metal
+  
