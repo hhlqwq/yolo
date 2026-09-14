@@ -296,7 +296,8 @@ class BaseTrainer:
             self.data["train"], batch_size=batch_size, rank=LOCAL_RANK, mode="train"
         )
         final_batch_size = len(self.train_loader.sampler) % self.train_loader.batch_size or self.train_loader.batch_size
-        if self.args.imgsz < 2 * self.stride and not self.train_loader.drop_last and final_batch_size == 1:
+        max_imgsz = max(self.args.imgsz) if isinstance(self.args.imgsz, (list, tuple)) else self.args.imgsz
+        if max_imgsz < 2 * self.stride and not self.train_loader.drop_last and final_batch_size == 1:
             raise ValueError(
                 f"final batch=1 training at imgsz={self.args.imgsz} gives BatchNorm a single value per channel; "
                 f"change batch or use imgsz >= {2 * self.stride}"

@@ -183,4 +183,6 @@ conda run --no-capture-output -n ult python tools/train2_detect_verify.py \
     --device 0
 ```
 
+`--imgsz` 接收高、宽两个值，正方形和矩形训练尺寸均会在创建数据加载器后正常执行最终 batch 的 BatchNorm 安全检查。如果训练在初始化阶段失败，已生成的非空实验目录不会自动删除或覆盖；重试时应通过 `--output-dir` 指定新的 `_0`、`_1` 等同级目录。
+
 ONNX 测试使用本次划分的验证集，因此结果属于验证集评估，不等同于独立外部测试集结果。测试默认使用 `conf=0.3`、`iou=0.5`，结果保存在实验目录的 `onnx_test/`。
