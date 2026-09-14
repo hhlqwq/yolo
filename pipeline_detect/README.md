@@ -155,13 +155,21 @@ conda run --no-capture-output -n ult python tools/split_train2_detect.py \
 
 图片默认使用 8 个线程并发复制到 NAS，以避免单线程逐张复制长时间没有反馈。NAS 负载较高时可以将 `--copy-workers` 调低到 `4`；带宽充足时可以尝试 `12`，不建议无上限提高并发数。
 
-划分成功后会在数据根目录生成 `train2_detect.yaml`。独立实验脚本读取该配置，依次执行 YOLO11s-P2 训练、`best.pt` 验证、板端格式 P2 ONNX 导出和 ONNX 验证集测试，不读取或写入 `pipeline_registry`、`model_history.json` 和 Pipeline Excel。
+划分成功后会在数据根目录生成 `train2_detect.yaml`。独立实验脚本读取该配置，可选 YOLO11s-P2 或 YOLO26s-P2，依次执行训练、`best.pt` 验证、板端格式 P2 ONNX 导出和 ONNX 验证集测试，不读取或写入 `pipeline_registry`、`model_history.json` 和 Pipeline Excel。
 
-默认初始权重为 V018 三类模型。加载到两类模型时只迁移形状匹配的参数，两类检测头由当前训练重新学习。默认输出目录为 `3_Train2/experiments/liquid_debris_verify_20260902`，已有非空输出目录时会停止，避免覆盖已有实验：
+默认使用 `yolo11s_p2`，初始权重为 V021 三类模型。加载到两类模型时只迁移形状匹配的参数，两类检测头由当前训练重新学习。默认输出目录为 `3_Train2/experiments/liquid_debris_verify_20260902`，已有非空输出目录时会停止，避免覆盖已有实验：
 
 ```bash
 conda run --no-capture-output -n ult python tools/train2_detect_verify.py
 ```
+
+YOLO26s-P2 使用 `/data/users/hailong.he/github/yolo/models/yolo26s.pt` 作为初始权重，默认输出到 `3_Train2/experiments/liquid_debris_yolo26s_p2_20260914`：
+
+```bash
+conda run --no-capture-output -n ult python tools/train2_detect_verify.py --model yolo26s_p2
+```
+
+Train2 使用独立的 `yolo26s_p2.yaml`，使用 YOLO26s 主干和颈部结构，检测头按照原 YOLO11s-P2 板端流程关闭 `end2end`、使用 `reg_max=16`，导出 P2-P5 四层原始 box/score 输出，保持现有板端 DFL 解码和 NMS 流程不变。初始 `yolo26s.pt` 中形状不匹配的 P2 分支和检测头参数不迁移，由当前两类训练重新学习。
 
 正式运行前可以显式覆盖权重和输出目录：
 

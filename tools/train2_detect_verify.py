@@ -6,6 +6,7 @@ import argparse
 import json
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +17,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from tools.export import export_yolov11_detect_p2  # noqa: E402
+from tools.export import export_detect_p2  # noqa: E402
 from ultralytics import YOLO  # noqa: E402
 
 
@@ -25,12 +26,12 @@ DEFAULT_DATA_YAML = Path(
     "算法工具链/算法应用（主）/应用场景/【舜宇】清洁机器人/DEMO开发/"
     "模型训练/experiments/train2_detect.yaml"
 )
-DEFAULT_OUTPUT_DIR = Path(
+DEFAULT_YOLO11_OUTPUT_DIR = Path(
     "/data/users/hailong.he/nas_smb/Docs_Internal/知识库(钉钉同构)/"
     "算法工具链/算法应用（主）/应用场景/【舜宇】清洁机器人/DEMO开发/"
     "模型训练/experiments/liquid_debris_verify_20260902"
 )
-DEFAULT_INITIAL_WEIGHT = Path(
+DEFAULT_YOLO11_INITIAL_WEIGHT = Path(
     "/data/users/hailong.he/nas_smb/Docs_Internal/知识库(钉钉同构)/"
     "算法工具链/算法应用（主）/应用场景/【舜宇】清洁机器人/DEMO开发/"
     "模型训练/V021_20260901_add0901/runs/yolo_detect_p2/train/weights/best.pt"
@@ -38,19 +39,42 @@ DEFAULT_INITIAL_WEIGHT = Path(
 EXPECTED_CLASS_NAMES = {0: "liquid", 1: "debris"}
 
 
+@dataclass(frozen=True)
+class ModelPreset:
+    """定义单个 P2 模型的默认结构、权重和输出。"""
+
+    model_yaml: Path
+    initial_weight: Path
+    output_dir: Path
+    onnx_name: str
+
+
+MODEL_PRESETS = {
+    "yolo11s_p2": ModelPreset(
+        model_yaml=REPO_ROOT / "ultralytics/cfg/models/11/yolo11s_p2.yaml",
+        initial_weight=DEFAULT_YOLO11_INITIAL_WEIGHT,
+        output_dir=DEFAULT_YOLO11_OUTPUT_DIR,
+        onnx_name="liquid_debris_yolo11s_p2.onnx",
+    ),
+    "yolo26s_p2": ModelPreset(
+        model_yaml=REPO_ROOT / "ultralytics/cfg/models/26/yolo26s_p2.yaml",
+        initial_weight=Path("/data/users/hailong.he/github/yolo/models/yolo26s.pt"),
+        output_dir=DEFAULT_YOLO11_OUTPUT_DIR.with_name("liquid_debris_yolo26s_p2_20260914"),
+        onnx_name="liquid_debris_yolo26s_p2.onnx",
+    ),
+}
+
+
 def parse_args() -> argparse.Namespace:
     """解析独立实验的数据、权重、输出和训练测试参数。"""
     parser = argparse.ArgumentParser(
         description="独立完成 liquid/debris 两类检测训练、验证、ONNX 导出和测试。"
     )
+    parser.add_argument("--model", choices=tuple(MODEL_PRESETS), default="yolo11s_p2")
     parser.add_argument("--data", type=Path, default=DEFAULT_DATA_YAML)
-    parser.add_argument(
-        "--model-yaml",
-        type=Path,
-        default=REPO_ROOT / "ultralytics/cfg/models/11/yolo11s_p2.yaml",
-    )
-    parser.add_argument("--initial-weight", type=Path, default=DEFAULT_INITIAL_WEIGHT)
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--model-yaml", type=Path)
+    parser.add_argument("--initial-weight", type=Path)
+    parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--imgsz", type=int, nargs=2, default=(640, 640))
@@ -99,10 +123,11 @@ def _validate_dataset_yaml(data_yaml: Path) -> None:
 
 def _validate_arguments(args: argparse.Namespace) -> tuple[Path, Path, Path, Path]:
     """检查实验所需文件、参数和防覆盖输出目录。"""
+    preset = MODEL_PRESETS[args.model]
     data_yaml = args.data.expanduser().resolve()
-    model_yaml = args.model_yaml.expanduser().resolve()
-    initial_weight = args.initial_weight.expanduser().resolve()
-    output_dir = args.output_dir.expanduser().resolve()
+    model_yaml = (args.model_yaml or preset.model_yaml).expanduser().resolve()
+    initial_weight = (args.initial_weight or preset.initial_weight).expanduser().resolve()
+    output_dir = (args.output_dir or preset.output_dir).expanduser().resolve()
     if not data_yaml.is_file():
         raise FileNotFoundError(f"数据 YAML 不存在: {data_yaml}")
     if not model_yaml.is_file():
@@ -178,6 +203,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[实验] 数据配置: {data_yaml}")
+    print(f"[实验] 模型: {args.model}; 结构: {model_yaml}")
     print(f"[实验] 初始权重: {initial_weight}")
     print(f"[实验] 输出目录: {output_dir}")
     model = YOLO(str(model_yaml))
@@ -217,9 +243,9 @@ def main() -> None:
     )
 
     onnx_dir.mkdir(parents=True, exist_ok=True)
-    onnx_path = onnx_dir / "liquid_debris_yolo11s_p2.onnx"
+    onnx_path = onnx_dir / MODEL_PRESETS[args.model].onnx_name
     exported = Path(
-        export_yolov11_detect_p2(
+        export_detect_p2(
             str(best_path),
             str(onnx_path),
             imgsz=list(args.imgsz),
@@ -237,6 +263,7 @@ def main() -> None:
     )
 
     summary = {
+        "model": args.model,
         "data": str(data_yaml),
         "model_yaml": str(model_yaml),
         "initial_weight": str(initial_weight),

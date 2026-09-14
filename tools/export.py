@@ -192,7 +192,7 @@ def v2_yolov11_seg_p2(
     return str(output_path)
 
 
-def export_yolov11_detect_p2(
+def export_detect_p2(
     pt_path: str,
     onnx_path: str | None = None,
     imgsz: int | Sequence[int] = 640,
@@ -334,5 +334,5 @@ if __name__ == "__main__":
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--opset", type=int, default=11)
     args = parser.parse_args()
-    function = export_yolov11_detect_p2 if args.task == "detect" else v2_yolov11_seg_p2
+    function = export_detect_p2 if args.task == "detect" else v2_yolov11_seg_p2
     function(args.weight, args.output, args.imgsz, args.device, args.opset)
