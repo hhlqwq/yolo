@@ -217,7 +217,7 @@ fuzz-models/
 *.db
 test/
 test_data/*
-model/*
+models/*
 data/*
 Log/*
 extracted_frames/*
