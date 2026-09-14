@@ -2,7 +2,7 @@
 
 # Copyright (c) Meta Platforms, Inc. and affiliates. All Rights Reserved
 
-import torch.nn as nn
+from torch import nn
 
 from ultralytics.nn.modules.transformer import MLP
 from ultralytics.utils.patches import torch_load
@@ -333,11 +333,11 @@ def build_interactive_sam3(checkpoint_path: str, compile=None, with_backbone=Tru
         no_obj_embed_spatial=True,
         proj_tpos_enc_in_obj_ptrs=True,
         use_signed_tpos_enc_to_obj_ptrs=True,
-        sam_mask_decoder_extra_args=dict(
-            dynamic_multimask_via_stability=True,
-            dynamic_multimask_stability_delta=0.05,
-            dynamic_multimask_stability_thresh=0.98,
-        ),
+        sam_mask_decoder_extra_args={
+            "dynamic_multimask_via_stability": True,
+            "dynamic_multimask_stability_delta": 0.05,
+            "dynamic_multimask_stability_thresh": 0.98,
+        },
     )
 
     # Load checkpoint if provided
@@ -354,6 +354,14 @@ def _load_checkpoint(model, checkpoint, interactive=False):
         ckpt = torch_load(f)
     if "model" in ckpt and isinstance(ckpt["model"], dict):
         ckpt = ckpt["model"]
+    # SAM 3.1 nests its point-prompt head as tracker.model.interactive_* beside the multiplex video tracker and renames
+    # its neck to interactive_convs, so map both onto the SAM 3 names (no-op for SAM 3 checkpoints)
+    ckpt = {
+        k.replace("tracker.model.interactive_", "tracker.")
+        .replace("tracker.model.interactivity_", "tracker.")
+        .replace("interactive_convs", "sam2_convs"): v
+        for k, v in ckpt.items()
+    }
     sam3_image_ckpt = {k.replace("detector.", ""): v for k, v in ckpt.items() if "detector" in k}
     if interactive:
         sam3_image_ckpt.update(

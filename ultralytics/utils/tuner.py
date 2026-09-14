@@ -145,7 +145,7 @@ def _convert_bohb_search_space(space):
         par = "/".join(str(p) for p in path)
         sampler = domain.get_sampler()
         if isinstance(sampler, Quantized):
-            raise ValueError("TuneBOHB does not support quantized search spaces with the current ConfigSpace version.")
+            raise TypeError("TuneBOHB does not support quantized search spaces with the current ConfigSpace version.")
 
         if isinstance(domain, Float) and isinstance(sampler, (Uniform, LogUniform)):
             cs.add(
@@ -163,7 +163,7 @@ def _convert_bohb_search_space(space):
         elif isinstance(domain, Categorical) and isinstance(sampler, Uniform):
             cs.add(ConfigSpace.CategoricalHyperparameter(par, choices=domain.categories))
         else:
-            raise ValueError(
+            raise TypeError(
                 f"TuneBOHB does not support parameters of type {type(domain).__name__} "
                 f"with sampler type {type(domain.sampler).__name__}."
             )
@@ -322,6 +322,20 @@ def _resolve_ray_search_alg(search_alg, task, space, iterations):
         if requirements:
             checks.check_requirements(requirements)
 
+        if normalized == "optuna":
+            from optuna.samplers import TPESampler
+            from ray.tune.search.optuna import OptunaSearch
+
+            return (
+                OptunaSearch(
+                    sampler=TPESampler(multivariate=True, constant_liar=True),
+                    metric=TASK2METRIC[task],
+                    mode="max",
+                ),
+                space,
+                normalized,
+            )
+
         from ray.tune.search import create_searcher
 
         return create_searcher(normalized, metric=TASK2METRIC[task], mode="max"), space, normalized
@@ -336,8 +350,8 @@ def run_ray_tune(
     space: dict | None = None,
     grace_period: int = 10,
     gpu_per_trial: int | None = None,
-    iterations: int = 10,
-    search_alg=None,
+    iterations: int = 300,
+    search_alg="optuna",
     **train_args,
 ):
     """Run hyperparameter tuning using Ray Tune.
@@ -349,8 +363,9 @@ def run_ray_tune(
         gpu_per_trial (int, optional): The number of GPUs to allocate per trial.
         iterations (int, optional): The maximum number of trials to run.
         search_alg (str | ray.tune.search.Searcher | ray.tune.search.SearchAlgorithm, optional): Search algorithm to
-            use. Strings are resolved to supported Ray Tune searchers. Pre-instantiated objects are reused, and known
-            searchers with special Tune param_space requirements are normalized automatically.
+            use. Defaults to Optuna multivariate TPE. Strings are resolved to supported Ray Tune searchers,
+            pre-instantiated objects are reused, and known searchers with special Tune param_space requirements are
+            normalized automatically.
         **train_args (Any): Additional arguments to pass to the `train()` method.
 
     Returns:
@@ -365,7 +380,7 @@ def run_ray_tune(
     """
     LOGGER.info("💡 Learn about RayTune at https://docs.ultralytics.com/integrations/ray-tune")
     try:
-        checks.check_requirements("ray[tune]", constrain=["pydantic>=2.0,<2.12"])
+        checks.check_requirements(["ray>=2.41.0", "ray[tune]"], constrain=["pydantic>=2.0,<2.12"])
 
         import ray
         from ray import tune
@@ -374,14 +389,6 @@ def run_ray_tune(
     except ImportError:
         raise ModuleNotFoundError('Ray Tune required but not found. To install run: pip install "ray[tune]"')
 
-    try:
-        import wandb
-
-        assert hasattr(wandb, "__version__")
-    except (ImportError, AssertionError):
-        wandb = False
-
-    checks.check_version(ray.__version__, ">=2.0.0", "ray")
     default_space = {
         # 'optimizer': tune.choice(['SGD', 'Adam', 'AdamW', 'NAdam', 'RAdam', 'RMSProp']),
         "lr0": tune.uniform(1e-5, 1e-2),  # initial learning rate (i.e. SGD=1E-2, Adam=1E-3)
@@ -408,7 +415,7 @@ def run_ray_tune(
         "mosaic": tune.uniform(0.0, 1.0),  # image mosaic (probability)
         "mixup": tune.uniform(0.0, 1.0),  # image mixup (probability)
         "cutmix": tune.uniform(0.0, 1.0),  # image cutmix (probability)
-        "copy_paste": tune.uniform(0.0, 1.0),  # segment copy-paste (probability)
+        "copy_paste": tune.uniform(0.0, 1.0),  # segment/obb copy-paste (object fraction)
         "close_mosaic": tune.randint(0, 11),  # close dataloader mosaic (epochs)
     }
 
@@ -427,10 +434,7 @@ def run_ray_tune(
 
         # Set trial-specific name for W&B logging
         try:
-            if hasattr(tune, "get_context"):
-                trial_id = tune.get_context().get_trial_id()  # Ray ≥2.7, get current trial ID (e.g., "tune_c1c1ce99")
-            else:
-                trial_id = tune.get_trial_id()  # Ray <2.7
+            trial_id = tune.get_context().get_trial_id()
             trial_suffix = trial_id.split("_")[-1] if "_" in trial_id else trial_id
             config["name"] = f"{base_name}_{trial_suffix}"
         except Exception:
@@ -438,12 +442,19 @@ def run_ray_tune(
             config["name"] = base_name
 
         results = model_to_train.train(**config)
+        if isinstance(config.get("data"), (list, tuple)):
+            metric = TASK2METRIC[task]
+            return {
+                metric: sum((metrics or {}).get(metric, 0.0) for metrics in results.values()) / len(results),
+                "epoch": config.get("epochs") or DEFAULT_CFG_DICT["epochs"],
+            }
         return results.results_dict
 
     # Get search space
-    if not space and not train_args.get("resume"):
+    if not space:
         space = default_space
-        LOGGER.warning("Search space not provided, using default search space.")
+        if not train_args.get("resume"):
+            LOGGER.warning("Search space not provided, using default search space.")
 
     # Get dataset
     data = train_args.get("data", TASK2DATA[task])
@@ -481,7 +492,7 @@ def run_ray_tune(
     tune_dir = get_save_dir(
         get_cfg(
             DEFAULT_CFG,
-            {**train_args, **{"exist_ok": train_args.pop("resume", False)}},  # resume w/ same tune_dir
+            {**train_args, "exist_ok": train_args.pop("resume", False)},  # resume w/ same tune_dir
         ),
         name=train_args.pop("name", "tune"),  # runs/{task}/{tune_dir}
     )  # must be absolute dir

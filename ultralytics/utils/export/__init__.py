@@ -1,6 +1,8 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
+from .ascend import onnx2ascend
 from .axelera import torch2axelera
+from .coreai import torch2coreai
 from .coreml import torch2coreml
 from .deepx import onnx2deepx
 from .engine import onnx2engine, torch2onnx
@@ -12,20 +14,21 @@ from .openvino import torch2openvino
 from .paddle import torch2paddle
 from .qnn import onnx2qnn
 from .rknn import onnx2rknn
-from .tensorflow import keras2pb, onnx2saved_model, pb2tfjs, tflite2edgetpu
+from .tensorflow import keras2pb, onnx2saved_model, tflite2edgetpu
 from .torchscript import torch2torchscript
 
 __all__ = [
     "keras2pb",
+    "onnx2ascend",
     "onnx2deepx",
     "onnx2engine",
     "onnx2mnn",
     "onnx2qnn",
     "onnx2rknn",
     "onnx2saved_model",
-    "pb2tfjs",
     "tflite2edgetpu",
     "torch2axelera",
+    "torch2coreai",
     "torch2coreml",
     "torch2executorch",
     "torch2imx",

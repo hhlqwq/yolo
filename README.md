@@ -656,3 +656,22 @@ export MPLBACKEND=Agg
 - 分割 Mask 系数、Proto 和原图裁剪还原是否正确。
 
 建议先使用 `tools/inference.py` 在 PC 上验证，再接入板端推理代码。
+
+## 13. 官方代码同步
+
+本仓库以 Ultralytics 官方仓库为上游，`upstream` 指向：
+
+```text
+https://github.com/ultralytics/ultralytics.git
+```
+
+2026-09-14 已将核心代码从本地 `v8.4.65` 基线同步至官方 `main` 的 `c33f13f5a8cfe7b01cc621279fd9caefff137374`，对应代码版本 `8.4.150`。本次同步保留 `pipeline/`、`pipeline_detect/`、`tools/`、本地数据集配置、矩形输入适配和训练日志增强；按项目约定未同步官方 `docs/` 文档目录。
+
+后续更新前先确认工作区干净，再抓取并合并官方分支：
+
+```bash
+git -c http.sslBackend=openssl fetch upstream main
+git merge --no-ff upstream/main
+```
+
+合并后应重点复核 `ultralytics/data/`、`ultralytics/engine/` 和 `ultralytics/utils/` 中的本地适配，不要直接用官方文件覆盖这些定制。

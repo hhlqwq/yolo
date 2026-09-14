@@ -12,6 +12,17 @@ from ultralytics.utils.checks import check_requirements
 
 from .base import BaseBackend
 
+# ONNX Runtime output type string -> (torch dtype, numpy dtype) for IO binding.
+_ORT_DTYPES = {
+    "tensor(float16)": (torch.float16, np.float16),
+    "tensor(float)": (torch.float32, np.float32),
+    "tensor(double)": (torch.float64, np.float64),
+    "tensor(uint8)": (torch.uint8, np.uint8),
+    "tensor(int8)": (torch.int8, np.int8),
+    "tensor(int32)": (torch.int32, np.int32),
+    "tensor(int64)": (torch.int64, np.int64),
+}
+
 
 class ONNXBackend(BaseBackend):
     """Microsoft ONNX Runtime inference backend with optional OpenCV DNN support.
@@ -21,7 +32,14 @@ class ONNXBackend(BaseBackend):
     with static input shapes.
     """
 
-    def __init__(self, weight: str | Path, device: torch.device, fp16: bool = False, format: str = "onnx"):
+    def __init__(
+        self,
+        weight: str | Path,
+        device: torch.device,
+        fp16: bool = False,
+        format: str = "onnx",
+        session_options: object | None = None,
+    ):
         """Initialize the ONNX backend.
 
         Args:
@@ -29,9 +47,11 @@ class ONNXBackend(BaseBackend):
             device (torch.device): Device to run inference on.
             fp16 (bool): Whether to use FP16 half-precision inference.
             format (str): Inference engine, either "onnx" for ONNX Runtime or "dnn" for OpenCV DNN.
+            session_options (object | None): Optional ONNX Runtime session options.
         """
         assert format in {"onnx", "dnn"}, f"Unsupported ONNX format: {format}."
         self.format = format
+        self.session_options = session_options
         super().__init__(weight, device, fp16)
 
     def load_model(self, weight: str | Path) -> None:
@@ -42,10 +62,11 @@ class ONNXBackend(BaseBackend):
         """
         cuda = isinstance(self.device, torch.device) and torch.cuda.is_available() and self.device.type != "cpu"
 
+        self.apply_metadata(self.read_metadata(weight))
+
         if self.format == "dnn":
             # OpenCV DNN
             LOGGER.info(f"Loading {weight} for ONNX OpenCV DNN inference...")
-            check_requirements("opencv-python>=4.5.4")
             import cv2
 
             self.net = cv2.dnn.readNetFromONNX(weight)
@@ -63,23 +84,28 @@ class ONNXBackend(BaseBackend):
                 providers = ["CoreMLExecutionProvider", "CPUExecutionProvider"]
             else:
                 providers = ["CPUExecutionProvider"]
-                if cuda:
-                    LOGGER.warning("CUDA requested but CUDAExecutionProvider not available. Using CPU...")
-                    self.device = torch.device("cpu")
-                    cuda = False
 
             LOGGER.info(
                 f"Using ONNX Runtime {onnxruntime.__version__} with "
                 f"{providers[0] if isinstance(providers[0], str) else providers[0][0]}"
             )
 
-            self.session = onnxruntime.InferenceSession(weight, providers=providers)
+            try:
+                self.session = onnxruntime.InferenceSession(weight, self.session_options, providers=providers)
+            except onnxruntime.capi.onnxruntime_pybind11_state.InvalidProtobuf as e:
+                # ONNX Runtime reports an unparsable graph as a raw protobuf error naming neither the problem
+                # nor a remedy. Only this one type is caught: other load failures are execution-provider or
+                # model-support issues, where the runtime's own message is the useful one.
+                raise TypeError(
+                    f"ERROR ❌️ {weight} is not a loadable ONNX model — the file is empty, truncated or corrupted "
+                    f"({type(e).__name__}: {e}).\nRecommend fixes are to re-export it with "
+                    f"'yolo export model=yolo26n.pt format=onnx', or to re-download the file."
+                ) from e
+            if cuda and "CUDAExecutionProvider" not in self.session.get_providers():
+                LOGGER.warning("CUDA requested but CUDAExecutionProvider not available. Using CPU...")
+                self.device = torch.device("cpu")
+                cuda = False
             self.output_names = [x.name for x in self.session.get_outputs()]
-
-            # Get metadata
-            metadata_map = self.session.get_modelmeta().custom_metadata_map
-            if metadata_map:
-                self.apply_metadata(dict(metadata_map))
 
             # Check if dynamic shapes
             self.dynamic = isinstance(self.session.get_outputs()[0].shape[0], str)
@@ -91,25 +117,26 @@ class ONNXBackend(BaseBackend):
                 self.io = self.session.io_binding()
                 self.bindings = []
                 for output in self.session.get_outputs():
-                    out_fp16 = "float16" in output.type
-                    y_tensor = torch.empty(output.shape, dtype=torch.float16 if out_fp16 else torch.float32).to(
-                        self.device
-                    )
+                    torch_dtype, np_dtype = _ORT_DTYPES.get(output.type, (torch.float32, np.float32))
+                    y_tensor = torch.empty(output.shape, dtype=torch_dtype).to(self.device)
                     self.io.bind_output(
                         name=output.name,
                         device_type=self.device.type,
                         device_id=self.device.index if cuda else 0,
-                        element_type=np.float16 if out_fp16 else np.float32,
+                        element_type=np_dtype,
                         shape=tuple(y_tensor.shape),
                         buffer_ptr=y_tensor.data_ptr(),
                     )
                     self.bindings.append(y_tensor)
 
-    def forward(self, im: torch.Tensor) -> torch.Tensor | list[torch.Tensor] | np.ndarray:
+    def forward(
+        self, im: torch.Tensor | dict[str, torch.Tensor | np.ndarray]
+    ) -> torch.Tensor | list[torch.Tensor] | np.ndarray:
         """Run ONNX inference using IO binding (CUDA) or standard session execution.
 
         Args:
-            im (torch.Tensor): Input image tensor in BCHW format, normalized to [0, 1].
+            im (torch.Tensor | dict): Input image tensor in BCHW format, normalized to [0, 1], or a dictionary mapping
+                input names to tensors/arrays for multi-input ONNX Runtime models.
 
         Returns:
             (torch.Tensor | list[torch.Tensor] | np.ndarray): Model predictions as tensor(s) or numpy array(s).
@@ -120,6 +147,10 @@ class ONNXBackend(BaseBackend):
             return self.net.forward()
 
         # ONNX Runtime
+        if isinstance(im, dict):  # multi-input model
+            im = {k: v.cpu().numpy() if isinstance(v, torch.Tensor) else v for k, v in im.items()}
+            return self.session.run(self.output_names, im)
+
         if self.use_io_binding:
             if self.device.type == "cpu":
                 im = im.cpu()
@@ -167,9 +198,7 @@ class ONNXIMXBackend(ONNXBackend):
         self.output_names = [x.name for x in self.session.get_outputs()]
         self.dynamic = isinstance(self.session.get_outputs()[0].shape[0], str)
         self.fp16 = "float16" in self.session.get_inputs()[0].type
-        metadata_map = self.session.get_modelmeta().custom_metadata_map
-        if metadata_map:
-            self.apply_metadata(dict(metadata_map))
+        self.apply_metadata(self.read_metadata(w))
 
     def forward(self, im: torch.Tensor) -> np.ndarray | list[np.ndarray] | tuple[np.ndarray, ...]:
         """Run IMX inference with task-specific output concatenation for detect, pose, and segment tasks.

@@ -42,6 +42,7 @@ class BOTrack(STrack):
     Examples:
         Create a BOTrack instance and update its features
         >>> bo_track = BOTrack(xywh=np.array([100, 50, 80, 40, 0]), score=0.9, cls=1, feat=np.random.rand(128))
+        >>> bo_track.activate(KalmanFilterXYWH(), frame_id=1)
         >>> bo_track.predict()
         >>> new_track = BOTrack(xywh=np.array([110, 60, 80, 40, 0]), score=0.85, cls=1, feat=np.random.rand(128))
         >>> bo_track.update(new_track, frame_id=2)
@@ -108,7 +109,7 @@ class BOTrack(STrack):
         """Predict the mean and covariance for multiple object tracks using a shared Kalman filter."""
         if not stracks:
             return
-        multi_mean = np.asarray([st.mean.copy() for st in stracks])
+        multi_mean = np.asarray([st.mean for st in stracks])
         multi_covariance = np.asarray([st.covariance for st in stracks])
         for i, st in enumerate(stracks):
             if st.state != TrackState.Tracked:
@@ -170,7 +171,7 @@ class BOTSORT(BYTETracker):
         # ReID module
         self.proximity_thresh = args.proximity_thresh
         self.appearance_thresh = args.appearance_thresh
-        self.encoder = build_encoder(args.with_reid, args.model)
+        self.encoder = build_encoder(args.with_reid, args.model, getattr(args, "device", None))
 
     def get_kalmanfilter(self) -> KalmanFilterXYWH:
         """Return an instance of KalmanFilterXYWH for predicting and updating object states in the tracking process."""
@@ -181,7 +182,7 @@ class BOTSORT(BYTETracker):
         if len(results) == 0:
             return []
         bboxes = parse_bboxes(results)
-        if self.args.with_reid and self.encoder is not None:
+        if self.args.with_reid and self.encoder is not None and img is not None:
             features_keep = self.encoder(img, bboxes)
             return [BOTrack(xywh, s, c, f) for (xywh, s, c, f) in zip(bboxes, results.conf, results.cls, features_keep)]
         return [BOTrack(xywh, s, c) for (xywh, s, c) in zip(bboxes, results.conf, results.cls)]

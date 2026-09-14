@@ -7,7 +7,6 @@ from functools import wraps
 from typing import Any
 
 import numpy as np
-import scipy.linalg
 import torch
 
 from ultralytics.utils.metrics import bbox_ioa
@@ -28,25 +27,6 @@ _LOOSE_NMS_IOU = 0.95  # looser NMS IoU used to recover detections the tight NMS
 _LOOSE_NMS_DEDUP_IOU = 0.97  # IoU threshold to consider duplicate detections as "new"
 
 
-def _nsa_kalman_update(
-    kf: KalmanFilterXYWH, mean: np.ndarray, covariance: np.ndarray, measurement: np.ndarray, confidence: float
-) -> tuple[np.ndarray, np.ndarray]:
-    """Run a NSA-Kalman update (StrongSORT) that scales the measurement noise by (1 - confidence)."""
-    w = max(1.0 - float(confidence), 0.05)
-    std = kf._std_weight_position * mean[2:4]
-    R = np.diag(np.square(np.r_[std, std])) * w
-    H = kf._update_mat
-    projected_mean = H @ mean
-    projected_cov = np.linalg.multi_dot((H, covariance, H.T)) + R
-
-    chol, low = scipy.linalg.cho_factor(projected_cov, lower=True, check_finite=False)
-    gain = scipy.linalg.cho_solve((chol, low), np.dot(covariance, H.T).T, check_finite=False).T
-    innovation = measurement - projected_mean
-    new_mean = mean + innovation @ gain.T
-    new_cov = covariance - np.linalg.multi_dot((gain, projected_cov, gain.T))
-    return new_mean, new_cov
-
-
 def _hmiou_distance(tracks_a: list[TTSTrack], tracks_b: list[TTSTrack]) -> tuple[np.ndarray, np.ndarray]:
     """Return (iou_sim, 1 - HMIoU) where HMIoU = HIoU * IoU and HIoU is vertical-overlap / vertical-union."""
     n, m = len(tracks_a), len(tracks_b)
@@ -61,22 +41,26 @@ def _hmiou_distance(tracks_a: list[TTSTrack], tracks_b: list[TTSTrack]) -> tuple
     return iou_sim, 1.0 - h_iou * iou_sim
 
 
-def _angle_distance(tracks: list[TTSTrack], dets: list[TTSTrack], frame_id: int, delta_t: int = 3) -> np.ndarray:
-    """Return angle distance between each track's corner velocities and the track-to-detection direction."""
-    if len(tracks) == 0 or len(dets) == 0:
-        return np.ones((len(tracks), len(dets)), dtype=np.float32)
-    track_boxes = np.stack([track.get_history_box(frame_id, delta_t) for track in tracks])  # (N, 4)
-    det_boxes = np.stack([det.xyxy for det in dets])  # (M, 4)
-    deltas = det_boxes[None] - track_boxes[:, None]  # (N, M, 4)
-    dx = deltas[:, :, _CORNER_DX_IDX]
-    dy = deltas[:, :, _CORNER_DY_IDX]
+def _angle_distance(
+    tracks: list[TTSTrack], dets: list[TTSTrack], frame_id: int, pairs: tuple[np.ndarray, np.ndarray], delta_t: int = 3
+) -> np.ndarray:
+    """Return angle distance for the IoU-supported `(track, det)` index `pairs` only.
+
+    `_cost_matrix` overwrites unsupported pairs, so a full `(N, M)` grid would compute discarded work.
+    """
+    track_idx, det_idx = pairs
+    track_boxes = np.stack([tracks[i].get_history_box(frame_id, delta_t) for i in track_idx])  # (P, 4)
+    det_boxes = np.stack([dets[i].xyxy for i in det_idx])  # (P, 4)
+    deltas = det_boxes - track_boxes  # (P, 4)
+    dx = deltas[:, _CORNER_DX_IDX]
+    dy = deltas[:, _CORNER_DY_IDX]
     norms = np.sqrt(dx * dx + dy * dy) + 1e-5
     dx /= norms
     dy /= norms
-    track_velocities = np.stack([track.velocity for track in tracks])  # (N, 4, 2)
-    dot = track_velocities[:, None, :, 0] * dx + track_velocities[:, None, :, 1] * dy
-    dist = np.abs(np.arccos(np.clip(dot, -1, 1))).mean(axis=-1) / np.pi  # (N, M)
-    return dist * np.array([det.score for det in dets])[None]
+    track_velocities = np.stack([tracks[i].velocity for i in track_idx])  # (P, 4, 2)
+    dot = track_velocities[:, :, 0] * dx + track_velocities[:, :, 1] * dy
+    dist = np.abs(np.arccos(np.clip(dot, -1, 1))).mean(axis=-1) / np.pi  # (P,)
+    return dist * np.array([dets[i].score for i in det_idx])
 
 
 def _confidence_distance(tracks: list[TTSTrack], dets: list[TTSTrack]) -> np.ndarray:
@@ -157,8 +141,9 @@ def attach_raw_preds_hook(predictor) -> None:
 
     @wraps(orig)
     def _wrapped(preds, img, orig_imgs, *args, **kwargs):
-        # copy=True so the in-place NMS xywh->xyxy conversion can't mutate this captured tensor (CPU aliasing)
-        predictor._raw_preds = preds.detach().to("cpu", copy=True) if isinstance(preds, torch.Tensor) else preds
+        raw = preds[0] if isinstance(preds, (list, tuple)) else preds  # PyTorch models return [inference, extras]
+        # clone() so the in-place NMS xywh->xyxy conversion can't mutate this capture; keep source device for box_iou
+        predictor._raw_preds = raw.detach().clone() if isinstance(raw, torch.Tensor) else raw
         predictor._postprocess_im = img
         predictor._postprocess_im0s = orig_imgs
         return orig(preds, img, orig_imgs, *args, **kwargs)
@@ -216,8 +201,10 @@ def _cosine_distance(tracks: list[TTSTrack], dets: list[TTSTrack]) -> np.ndarray
     dfeat = [d.curr_feat for d in dets]
     dim = next((f.shape[0] for f in (*tfeat, *dfeat) if f is not None), 128)
     zeros = np.zeros(dim, dtype=np.float32)
-    T = np.stack([f if f is not None else zeros for f in tfeat])
-    D = np.stack([f if f is not None else zeros for f in dfeat])
+    # Pin float32 as `matching.embedding_distance` does: an unpinned stack inherits the encoder's dtype, so a
+    # half-precision ReID backend (`quantize=16`, or a float16 ONNX model) would decide this cost matrix' precision.
+    T = np.asarray([f if f is not None else zeros for f in tfeat], dtype=np.float32)
+    D = np.asarray([f if f is not None else zeros for f in dfeat], dtype=np.float32)
     valid = np.array([f is not None for f in tfeat])[:, None] & np.array([f is not None for f in dfeat])[None, :]
     return np.where(valid, np.clip(1 - T @ D.T, 0, 1), np.nan).astype(np.float32)
 
@@ -242,7 +229,7 @@ class TTSTrack(BOTrack):
 
     Examples:
         Create and activate a new track
-        >>> track = TTSTrack([100, 200, 50, 80, 0], score=0.9, cls="person")
+        >>> track = TTSTrack(np.array([100, 200, 50, 80, 0]), score=0.9, cls="person")
         >>> track.activate(KalmanFilterXYWH(), frame_id=1)
     """
 
@@ -281,27 +268,26 @@ class TTSTrack(BOTrack):
                 return box.copy()
         if self._history:
             return self._history[-1][1].copy()
-        return self.xyxy.copy()
+        return self.xyxy
 
     def activate(self, kalman_filter: KalmanFilterXYWH, frame_id: int) -> None:
         """Initialize Kalman state and promote to New state."""
         self.kalman_filter = kalman_filter
         self.track_id = self.next_id()
         self.mean, self.covariance = kalman_filter.initiate(self.convert_coords(self._tlwh))
-        self._history.append((frame_id, self.xyxy.copy()))
+        self._history.append((frame_id, self.xyxy))
         self.tracklet_len = 0
-        self.state = TrackState.New
-        if frame_id == 1:
-            self.is_activated = True
+        self.state = TrackState.Tracked if self.min_track_len <= 1 else TrackState.New
+        self.is_activated = frame_id == 1 or self.state == TrackState.Tracked
         self.frame_id = self.start_frame = frame_id
 
     def re_activate(self, new_track, frame_id: int, new_id: bool = False) -> None:
         """Rebind a lost track to a fresh detection via NSA-Kalman."""
         self.prev_score = self.score
-        self.mean, self.covariance = _nsa_kalman_update(
-            self.kalman_filter, self.mean, self.covariance, self.convert_coords(new_track.tlwh), new_track.score
+        self.mean, self.covariance = self.kalman_filter.update(
+            self.mean, self.covariance, self.convert_coords(new_track.tlwh), confidence=new_track.score
         )
-        self._history.append((frame_id, self.xyxy.copy()))
+        self._history.append((frame_id, self.xyxy))
         self.score = new_track.score  # set before update_features so the EMA weight uses the current confidence
         if new_track.curr_feat is not None:
             self.update_features(new_track.curr_feat)
@@ -318,10 +304,10 @@ class TTSTrack(BOTrack):
         self.frame_id = frame_id
         self.tracklet_len += 1
         self.prev_score = self.score
-        self.mean, self.covariance = _nsa_kalman_update(
-            self.kalman_filter, self.mean, self.covariance, self.convert_coords(new_track.tlwh), new_track.score
+        self.mean, self.covariance = self.kalman_filter.update(
+            self.mean, self.covariance, self.convert_coords(new_track.tlwh), confidence=new_track.score
         )
-        self._history.append((frame_id, new_track.xyxy.copy()))
+        self._history.append((frame_id, new_track.xyxy))
 
         velocity = np.zeros((4, 2), dtype=np.float32)
         curr_box = new_track.xyxy
@@ -336,7 +322,7 @@ class TTSTrack(BOTrack):
         if new_track.curr_feat is not None:
             self.update_features(new_track.curr_feat)
 
-        if self.state == TrackState.Tracked or self.tracklet_len >= self.min_track_len:
+        if self.state == TrackState.Tracked or self.tracklet_len + 1 >= self.min_track_len:
             self.state = TrackState.Tracked
             self.is_activated = True
         self.cls, self.angle, self.idx = new_track.cls, new_track.angle, new_track.idx
@@ -408,7 +394,9 @@ class TRACKTRACK:
 
         from .utils.reid import build_encoder
 
-        self.encoder = build_encoder(getattr(args, "with_reid", False), getattr(args, "model", "auto"))
+        self.encoder = build_encoder(
+            getattr(args, "with_reid", False), getattr(args, "model", "auto"), getattr(args, "device", None)
+        )
 
     @classmethod
     def setup_predictor(cls, predictor):
@@ -416,9 +404,11 @@ class TRACKTRACK:
 
         Recovered (loose-NMS) detections are box-only and have no row in the post-NMS Results, so on segment/pose
         tasks they cannot carry mask/keypoint data and would mis-index downstream; skip recovery (and its
-        per-frame overhead) for those tasks.
+        per-frame overhead) for those tasks and RT-DETR predictors, which do not suppress boxes with NMS.
         """
-        if predictor.args.task in {"detect", "obb"}:
+        from ultralytics.models.yolo.detect import DetectionPredictor
+
+        if predictor.args.task in {"detect", "obb"} and isinstance(predictor, DetectionPredictor):
             attach_raw_preds_hook(predictor)
 
     @classmethod
@@ -437,9 +427,12 @@ class TRACKTRACK:
         else:
             cost = hmiou_dist
         cost += self.conf_weight * _confidence_distance(tracks, dets)
-        cost += self.angle_weight * _angle_distance(tracks, dets, self.frame_id)
         if iou_sim.size > 0:
-            cost[iou_sim <= 0.10] = 1.0
+            supported = iou_sim > 0.10
+            pairs = np.nonzero(supported)
+            if len(pairs[0]):
+                cost[pairs] += self.angle_weight * _angle_distance(tracks, dets, self.frame_id, pairs)
+            cost[~supported] = 1.0
         return np.clip(cost, 0, 1)
 
     def _apply_gmc(self, img: np.ndarray, detections: list, pools: list[list[TTSTrack]]) -> None:
@@ -457,7 +450,7 @@ class TRACKTRACK:
         self.frame_id += 1
         activated, refind, lost, removed = [], [], [], []
 
-        scores = results.conf
+        scores = np.asarray(results.conf)  # keep masks numpy; numpy coerces a 1-element torch bool mask via __index__
         boxes = parse_bboxes(results)
         high_mask = scores >= self.args.track_high_thresh
         low_mask = (scores > self.args.track_low_thresh) & (scores < self.args.track_high_thresh)
@@ -492,14 +485,16 @@ class TRACKTRACK:
                 del_boxes = np.concatenate([del_xywh[mask], -np.ones((mask.sum(), 1))], axis=-1)
                 dets_recovered = [_new_track(b, s, c) for b, s, c in zip(del_boxes, del_conf[mask], del_cls[mask])]
 
+        # Route by state: frame-1 tracks are visible (is_activated) but still New, so they must stay unconfirmed
         unconfirmed, tracked = [], []
         for track in self.tracked_stracks:
-            (unconfirmed if not track.is_activated else tracked).append(track)
+            (tracked if track.state == TrackState.Tracked else unconfirmed).append(track)
         pool = joint_stracks(tracked, self.lost_stracks)
 
-        if img is not None:
+        if img is not None and self.gmc.method is not None:
             self._apply_gmc(img, dets_high, [pool, unconfirmed])
         TTSTrack.multi_predict(pool)
+        TTSTrack.multi_predict(unconfirmed)
 
         # Main association: pool vs (high + low + recovered) detections, with per-bucket cost penalties.
         all_dets = dets_high + dets_low + dets_recovered

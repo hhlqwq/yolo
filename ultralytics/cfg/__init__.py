@@ -20,9 +20,9 @@ from ultralytics.utils import (
     FLOAT_OR_INT,
     IS_VSCODE,
     LOGGER,
+    PLATFORM_URL,
     RANK,
     ROOT,
-    RUNS_DIR,
     SETTINGS,
     SETTINGS_FILE,
     STR_OR_PATH,
@@ -55,43 +55,48 @@ SOLUTION_MAP = {
     "help": None,
 }
 
-# Define valid tasks and modes
-MODES = frozenset({"train", "val", "predict", "export", "track", "benchmark"})
-TASKS = frozenset({"detect", "segment", "classify", "pose", "obb", "semantic"})
+# Define valid tasks and modes, ordered as they appear across the docs and Ultralytics Platform
+MODES = ("train", "val", "predict", "export", "track", "benchmark")
+TASKS = ("detect", "segment", "semantic", "depth", "classify", "pose", "obb")
 TASK2DATA = {
     "detect": "coco8.yaml",
     "segment": "coco8-seg.yaml",
+    "semantic": "cityscapes8.yaml",
+    "depth": "depth8.yaml",
     "classify": "imagenet10",
     "pose": "coco8-pose.yaml",
     "obb": "dota8.yaml",
-    "semantic": "cityscapes8.yaml",
 }
 TASK2CALIBRATIONDATA = {
     "detect": "coco128.yaml",
     "segment": "coco128-seg.yaml",
+    "semantic": "cityscapes8.yaml",
+    "depth": "depth8.yaml",
     "classify": "imagenet100",
     "pose": "coco8-pose.yaml",
     "obb": "dota128.yaml",
-    "semantic": "cityscapes8.yaml",
 }
 TASK2MODEL = {
     "detect": "yolo26n.pt",
     "segment": "yolo26n-seg.pt",
+    "semantic": "yolo26n-sem.pt",
+    "depth": "yolo26n-depth.pt",
     "classify": "yolo26n-cls.pt",
     "pose": "yolo26n-pose.pt",
     "obb": "yolo26n-obb.pt",
-    "semantic": "yolo26n-sem.pt",
 }
 TASK2METRIC = {
     "detect": "metrics/mAP50-95(B)",
     "segment": "metrics/mAP50-95(M)",
+    "semantic": "metrics/mIoU",
+    "depth": "metrics/delta1",
     "classify": "metrics/accuracy_top1",
     "pose": "metrics/mAP50-95(P)",
     "obb": "metrics/mAP50-95(B)",
-    "semantic": "metrics/mIoU",
 }
 
 ARGV = sys.argv or ["", ""]  # sometimes sys.argv = []
+_YOLO_CLI_COMMAND = [sys.executable, "-m", "ultralytics.cfg.__init__"]
 SOLUTIONS_HELP_MSG = f"""
     Arguments received: {["yolo", *ARGV[1:]]!s}. Ultralytics 'yolo solutions' usage overview:
 
@@ -161,15 +166,37 @@ CLI_HELP_MSG = f"""
         yolo checks
         yolo version
         yolo settings
+        yolo login API_KEY
+        yolo logout
         yolo copy-cfg
         yolo cfg
         yolo solutions help
 
     Docs: https://docs.ultralytics.com
-    Solutions: https://docs.ultralytics.com/solutions/
+    Platform: https://platform.ultralytics.com
     Community: https://community.ultralytics.com
     GitHub: https://github.com/ultralytics/ultralytics
     """
+
+# Quantization aliases: maps any accepted `quantize` value to its canonical form. The common case is the integer
+# bit-width 8 (INT8) / 16 (FP16) / 32 (FP32); the verbose w<weights>a<activations> strings are accepted too and
+# collapse to the same ints, except the mixed-precision schemes that have no bit-width shorthand: 'w8a16' (INT8
+# weights + FP16 activations) and 'w8a32' (INT8 weights + FP32 activations, i.e. LiteRT dynamic/weight-only INT8).
+QUANTIZE_ALIASES = {
+    "8": 8,
+    "16": 16,
+    "32": 32,
+    "int8": 8,
+    "fp16": 16,
+    "fp32": 32,
+    "w8a8": 8,
+    "w16a16": 16,
+    "w32a32": 32,
+    "w8a16": "w8a16",
+    "w8a32": "w8a32",
+}
+QUANTIZE_DOCS_URL = "https://docs.ultralytics.com/modes/export#quantization-options"
+QUANTIZE_VALID_VALUES = "8, 16, 32, 'int8', 'fp16', 'fp32', 'w8a8', 'w16a16', 'w8a16', or 'w8a32'"
 
 # Define keys for arg type checks
 CFG_FLOAT_KEYS = frozenset(
@@ -177,8 +204,14 @@ CFG_FLOAT_KEYS = frozenset(
         "warmup_epochs",
         "box",
         "cls",
-        "cls_pw",
         "dfl",
+        "pose",
+        "kobj",
+        "rle",
+        "angle",
+        "dlog",
+        "dgrad",
+        "dis",
         "degrees",
         "shear",
         "time",
@@ -187,10 +220,11 @@ CFG_FLOAT_KEYS = frozenset(
     }
 )
 CFG_FRACTION_KEYS = frozenset(
-    {  # fractional float arguments with 0.0<=values<=1.0
+    {  # fractional floats use [0.0, 1.0]; dataset fraction also accepts positive counts and split pairs
         "dropout",
         "lr0",
         "lrf",
+        "cls_pw",
         "momentum",
         "weight_decay",
         "warmup_momentum",
@@ -207,10 +241,12 @@ CFG_FRACTION_KEYS = frozenset(
         "mixup",
         "cutmix",
         "copy_paste",
+        "erasing",
         "conf",
         "iou",
         "fraction",
         "multi_scale",
+        "dlam",
     }
 )
 CFG_INT_KEYS = frozenset(
@@ -228,6 +264,13 @@ CFG_INT_KEYS = frozenset(
         "save_period",
     }
 )
+CFG_INT_MIN = {  # minimum valid values for integer arguments used as divisors, sizes or seeds
+    "nbs": 1,
+    "max_det": 1,
+    "mask_ratio": 1,
+    "vid_stride": 1,
+    "seed": 0,
+}
 CFG_BOOL_KEYS = frozenset(
     {  # boolean-only arguments
         "save",
@@ -240,7 +283,6 @@ CFG_BOOL_KEYS = frozenset(
         "overlap_mask",
         "val",
         "save_json",
-        "half",
         "dnn",
         "plots",
         "show",
@@ -257,14 +299,15 @@ CFG_BOOL_KEYS = frozenset(
         "show_boxes",
         "keras",
         "optimize",
-        "int8",
         "dynamic",
         "simplify",
         "nms",
         "profile",
-        "end2end",
+        "channels_last",
+        "cls_remap",
     }
 )
+CFG_STR_KEYS = frozenset({"optimizer", "split", "copy_paste_mode", "auto_augment"})
 
 
 def cfg2dict(cfg: str | Path | dict | SimpleNamespace) -> dict:
@@ -325,7 +368,7 @@ def get_cfg(
           `project` and `name` to strings and validating configuration keys and values.
         - The function performs type and value checks on the configuration data.
     """
-    cfg = cfg2dict(cfg)
+    cfg = _handle_deprecation(cfg2dict(cfg))
 
     # Merge overrides
     if overrides:
@@ -338,7 +381,7 @@ def get_cfg(
         if k in cfg and isinstance(cfg[k], FLOAT_OR_INT):
             cfg[k] = str(cfg[k])
     if cfg.get("name") == "model":  # assign model to 'name' arg
-        cfg["name"] = str(cfg.get("model", "")).partition(".")[0]
+        cfg["name"] = Path(str(cfg.get("model") or "")).stem
         LOGGER.warning(f"'name=model' automatically updated to 'name={cfg['name']}'.")
 
     # Type and Value checks
@@ -373,9 +416,14 @@ def check_cfg(cfg: dict, hard: bool = True) -> None:
     Notes:
         - The function modifies the input dictionary in-place.
         - None values are ignored as they may be from optional arguments.
-        - Fraction keys are checked to be within the range [0.0, 1.0].
+        - Fraction keys use [0.0, 1.0]; dataset fraction also accepts counts and [train, val, test] lists.
     """
+    typed_keys = CFG_FLOAT_KEYS | CFG_FRACTION_KEYS | CFG_INT_KEYS | CFG_BOOL_KEYS | CFG_STR_KEYS | {"scale", "compile"}
     for k, v in cfg.items():
+        if v is None and (
+            k == "amp" or (DEFAULT_CFG_DICT.get(k) is not None and k in typed_keys and k != "auto_augment")
+        ):
+            raise TypeError(f"'{k}=None' is invalid. '{k}' must not be None.")
         if v is not None:  # None values may be from optional args
             if k in CFG_FLOAT_KEYS and not isinstance(v, FLOAT_OR_INT):
                 if hard:
@@ -404,6 +452,17 @@ def check_cfg(cfg: dict, hard: bool = True) -> None:
                 if not (0.0 <= v <= 1.0):
                     raise ValueError(f"'{k}={v}' is an invalid value. Valid '{k}' values are between 0.0 and 1.0.")
             elif k in CFG_FRACTION_KEYS:
+                if k == "fraction" and isinstance(v, list):
+                    if (
+                        len(v) not in {2, 3}
+                        or not all(v[:2])
+                        or not all((type(x) is int and x >= 0) or (type(x) is float and 0.0 <= x <= 1.0) for x in v)
+                    ):
+                        raise ValueError(f"'{k}={v}' is invalid. Use [train, val] or [train, val, test] counts/ratios.")
+                    cfg[k] = [float(x) if x in {0, 1} else x for x in v]
+                    continue
+                if k == "fraction" and isinstance(v, bool):
+                    raise TypeError(f"'{k}={v}' is of invalid type bool. Valid '{k}' types are int, float, or list")
                 if not isinstance(v, FLOAT_OR_INT):
                     if hard:
                         raise TypeError(
@@ -411,14 +470,20 @@ def check_cfg(cfg: dict, hard: bool = True) -> None:
                             f"Valid '{k}' types are int (i.e. '{k}=0') or float (i.e. '{k}=0.5')"
                         )
                     cfg[k] = v = float(v)
-                if not (0.0 <= v <= 1.0):
-                    raise ValueError(f"'{k}={v}' is an invalid value. Valid '{k}' values are between 0.0 and 1.0.")
-            elif k in CFG_INT_KEYS and not isinstance(v, int):
-                if hard:
-                    raise TypeError(
-                        f"'{k}={v}' is of invalid type {type(v).__name__}. '{k}' must be an int (i.e. '{k}=8')"
-                    )
-                cfg[k] = int(v)
+                valid = 0.0 <= v <= 1.0 or (k == "fraction" and isinstance(v, int) and v > 1)
+                if not valid or (k == "fraction" and v == 0.0):
+                    raise ValueError(f"'{k}={v}' invalid. Use integer count >1 or ratio (0, 1] for fraction.")
+                if k == "fraction" and v == 1:
+                    cfg[k] = 1.0
+            elif k in CFG_INT_KEYS:
+                if not isinstance(v, int):
+                    if hard:
+                        raise TypeError(
+                            f"'{k}={v}' is of invalid type {type(v).__name__}. '{k}' must be an int (i.e. '{k}=8')"
+                        )
+                    cfg[k] = v = int(v)
+                if k in CFG_INT_MIN and v < CFG_INT_MIN[k]:
+                    raise ValueError(f"'{k}={v}' is an invalid value. '{k}' must be >= {CFG_INT_MIN[k]}.")
             elif k in CFG_BOOL_KEYS and not isinstance(v, bool):
                 if hard:
                     raise TypeError(
@@ -426,6 +491,33 @@ def check_cfg(cfg: dict, hard: bool = True) -> None:
                         f"'{k}' must be a bool (i.e. '{k}=True' or '{k}=False')"
                     )
                 cfg[k] = bool(v)
+            elif k in CFG_STR_KEYS and not isinstance(v, str):
+                if hard:
+                    raise TypeError(f"'{k}={v}' is of invalid type {type(v).__name__}. '{k}' must be a str.")
+                cfg[k] = str(v)
+            elif k == "compile" and not isinstance(v, (bool, str)):  # False=off, True="default", or a mode string
+                if hard:
+                    raise TypeError(
+                        f"'{k}={v}' is of invalid type {type(v).__name__}. "
+                        f"'{k}' must be a bool or str (i.e. '{k}=True' or '{k}=max-autotune')"
+                    )
+                cfg[k] = bool(v)
+            elif k == "amp":
+                if not isinstance(v, bool) and str(v).lower() not in {"fp16", "bf16", "fp32"}:
+                    raise ValueError(
+                        f"'{k}={v}' is invalid. Valid '{k}' values are True, False, 'fp16', 'bf16', or 'fp32'."
+                    )
+                cfg[k] = v.lower() if isinstance(v, str) else v
+            elif k == "quantize":  # canonicalize 8/16/32 or w-notation to a scheme (unset stays None for FP32)
+                scheme = QUANTIZE_ALIASES.get(str(v).lower())
+                if scheme is None:
+                    if hard:
+                        raise ValueError(
+                            f"'{k}={v}' is invalid. Valid '{k}' values are {QUANTIZE_VALID_VALUES}. "
+                            f"See {QUANTIZE_DOCS_URL}"
+                        )
+                else:
+                    cfg[k] = scheme
 
 
 def get_save_dir(args: SimpleNamespace, name: str | None = None) -> Path:
@@ -442,10 +534,9 @@ def get_save_dir(args: SimpleNamespace, name: str | None = None) -> Path:
 
     Examples:
         >>> from types import SimpleNamespace
-        >>> args = SimpleNamespace(project="my_project", task="detect", mode="train", exist_ok=True)
-        >>> save_dir = get_save_dir(args)
-        >>> print(save_dir)
-        runs/detect/my_project/train
+        >>> args = SimpleNamespace(project="my_project", name="exp", task="detect", mode="train", exist_ok=True)
+        >>> get_save_dir(args).parts[-3:]
+        ('detect', 'my_project', 'exp')
     """
     if getattr(args, "save_dir", None):
         save_dir = args.save_dir
@@ -454,7 +545,7 @@ def get_save_dir(args: SimpleNamespace, name: str | None = None) -> Path:
 
         project = args.project or ""
         if not Path(project).is_absolute():
-            base = ROOT.parent / "tests/tmp/runs" if TESTS_RUNNING else RUNS_DIR
+            base = ROOT.parent / "tests/tmp/runs" if TESTS_RUNNING else Path(SETTINGS["runs_dir"])
             worker = os.environ.get("PYTEST_XDIST_WORKER")
             if worker and TESTS_RUNNING:  # isolate parallel pytest-xdist workers
                 base = base / worker
@@ -491,6 +582,25 @@ def _handle_deprecation(custom: dict) -> dict:
         "line_thickness": ("line_width", lambda v: v),
     }
     removed_keys = {"label_smoothing", "save_hybrid", "crop_fraction"}
+
+    if "end2end" in custom:
+        end2end = custom.pop("end2end")
+        if end2end is not None:
+            if not isinstance(end2end, bool):
+                raise TypeError("Deprecated 'end2end' must be a bool.")
+            custom["nms"] = False if end2end else True if custom.get("nms") is True else None
+            deprecation_warn(f"end2end={end2end}", f"nms={custom.get('nms')}")
+
+    # Forward the deprecated precision flags onto the unified `quantize` scheme (int8 wins over half). The value is read
+    # as a bool so quoted/string 'False' disables it while a bare CLI flag (empty string) enables it; an explicit false
+    # flag maps to None to clear any inherited quantize. An explicit `quantize=` always wins over the legacy flags.
+    int8 = custom.pop("int8", None)
+    half = custom.pop("half", None)
+    if (int8 is not None or half is not None) and "quantize" not in custom:
+        int8_on = int8 is not None and str(int8).strip().lower() not in {"none", "false", "0"}
+        half_on = half is not None and str(half).strip().lower() not in {"none", "false", "0"}
+        custom["quantize"] = 8 if int8_on else 16 if half_on else None  # False/0 clears precision back to FP32
+        deprecation_warn("int8" if int8 is not None else "half", "quantize")
 
     for old_key, (new_key, transform) in deprecated_mappings.items():
         if old_key not in custom:
@@ -529,6 +639,7 @@ def check_dict_alignment(
         ...     check_dict_alignment(base_cfg, custom_cfg)
         ... except SyntaxError:
         ...     print("Mismatched keys found")
+        Mismatched keys found
 
     Notes:
         - Suggests corrections for mismatched keys based on similarity to valid keys.
@@ -549,7 +660,8 @@ def check_dict_alignment(
             matches = [f"{k}={base[k]}" if base.get(k) is not None else k for k in matches]
             match_str = f"Similar arguments are i.e. {matches}." if matches else ""
             string += f"'{colorstr('red', 'bold', x)}' is not a valid YOLO argument. {match_str}\n"
-        raise SyntaxError(string + CLI_HELP_MSG) from e
+        LOGGER.info(CLI_HELP_MSG)
+        raise SyntaxError(string) from e
 
 
 def merge_equals_args(args: list[str]) -> list[str]:
@@ -611,33 +723,31 @@ def merge_equals_args(args: list[str]) -> list[str]:
     return new_args
 
 
-def handle_yolo_hub(args: list[str]) -> None:
-    """Handle Ultralytics HUB command-line interface (CLI) commands for authentication.
+def handle_yolo_login(args: list[str]) -> None:
+    """Log in to Ultralytics Platform with an API key or remove the saved key."""
+    if args[0] == "logout":
+        SETTINGS["api_key"] = ""
+        LOGGER.info("Logged out ✅. To log in again, use 'yolo login API_KEY'.")
+        return
 
-    This function processes Ultralytics HUB CLI commands such as login and logout. It should be called when executing a
-    script with arguments related to HUB authentication.
+    api_key_url = f"{PLATFORM_URL}/settings?tab=api-keys"
+    if len(args) < 2:
+        LOGGER.info(f"Get an API key from {api_key_url} and then run 'yolo login API_KEY'.")
+        return
 
-    Args:
-        args (list[str]): A list of command line arguments. The first argument should be either 'login' or 'logout'. For
-            'login', an optional second argument can be the API key.
+    from ultralytics import APIConnectionError, APIError, Platform
 
-    Examples:
-        $ yolo login YOUR_API_KEY
-
-    Notes:
-        - The function imports the 'hub' module from ultralytics to perform login and logout operations.
-        - For the 'login' command, if no API key is provided, an empty string is passed to the login function.
-        - The 'logout' command does not require any additional arguments.
-    """
-    from ultralytics import hub
-
-    if args[0] == "login":
-        key = args[1] if len(args) > 1 else ""
-        # Log in to Ultralytics HUB using the provided API key
-        hub.login(key)
-    elif args[0] == "logout":
-        # Log out from Ultralytics HUB
-        hub.logout()
+    try:
+        with Platform(api_key=args[1], base_url=PLATFORM_URL, timeout=30) as client:
+            client.account.summary()
+        SETTINGS["api_key"] = args[1]
+        LOGGER.info("New authentication successful ✅")
+    except APIError as error:
+        raise SystemExit(
+            "Invalid API key" if error.status_code == 401 else f"Authentication failed (HTTP {error.status_code})"
+        ) from None
+    except APIConnectionError as error:
+        raise SystemExit(f"Authentication request failed, check your connection: {error}") from None
 
 
 def handle_yolo_settings(args: list[str]) -> None:
@@ -660,9 +770,9 @@ def handle_yolo_settings(args: list[str]) -> None:
         - The function will check for alignment between the provided settings and the existing ones.
         - After processing, the updated settings will be displayed.
         - For more information on handling YOLO settings, visit:
-          https://docs.ultralytics.com/quickstart/#ultralytics-settings
+          https://docs.ultralytics.com/usage/settings
     """
-    url = "https://docs.ultralytics.com/quickstart/#ultralytics-settings"  # help URL
+    url = "https://docs.ultralytics.com/usage/settings"  # help URL
     try:
         if any(args):
             if args[0] == "reset":
@@ -755,7 +865,8 @@ def handle_yolo_solutions(args: list[str]) -> None:
                 "--server.headless",
                 "true",
                 overrides.pop("model", "yolo26n.pt"),
-            ]
+            ],
+            check=False,
         )
     else:
         import cv2  # Only needed for cap and vw functionality
@@ -844,7 +955,7 @@ def smart_value(v: str) -> Any:
         3.14
         >>> smart_value("True")
         True
-        >>> smart_value("None")
+        >>> print(smart_value("None"))
         None
         >>> smart_value("some_string")
         'some_string'
@@ -907,12 +1018,11 @@ def entrypoint(debug: str = "") -> None:
         "version": lambda: LOGGER.info(__version__),
         "settings": lambda: handle_yolo_settings(args[1:]),
         "cfg": lambda: YAML.print(DEFAULT_CFG_PATH),
-        "hub": lambda: handle_yolo_hub(args[1:]),
-        "login": lambda: handle_yolo_hub(args),
-        "logout": lambda: handle_yolo_hub(args),
+        "login": lambda: handle_yolo_login(args),
+        "logout": lambda: handle_yolo_login(args),
         "copy-cfg": copy_default_cfg,
         "solutions": lambda: handle_yolo_solutions(args[1:]),
-        "help": lambda: LOGGER.info(CLI_HELP_MSG),  # help below hub for -h flag precedence
+        "help": lambda: LOGGER.info(CLI_HELP_MSG),
     }
     full_args_dict = {**DEFAULT_CFG_DICT, **{k: None for k in TASKS}, **{k: None for k in MODES}, **special}
 
@@ -934,7 +1044,10 @@ def entrypoint(debug: str = "") -> None:
                 k, v = parse_key_value_pair(a)
                 if k == "cfg" and v is not None:  # custom.yaml passed
                     LOGGER.info(f"Overriding {DEFAULT_CFG_PATH} with {v}")
-                    overrides = {k: val for k, val in YAML.load(checks.check_yaml(v)).items() if k != "cfg"}
+                    overrides = {
+                        **{k: val for k, val in YAML.load(checks.check_yaml(v)).items() if k != "cfg"},
+                        **overrides,
+                    }
                 else:
                     overrides[k] = v
             except (NameError, SyntaxError, ValueError, AssertionError) as e:
@@ -949,6 +1062,8 @@ def entrypoint(debug: str = "") -> None:
             return
         elif a in DEFAULT_CFG_DICT and isinstance(DEFAULT_CFG_DICT[a], bool):
             overrides[a] = True  # auto-True for default bool args, i.e. 'yolo show' sets show=True
+        elif a in {"half", "int8", "end2end", "nms"}:
+            overrides[a] = True  # bare boolean flags whose defaults are missing or None
         elif a in DEFAULT_CFG_DICT:
             raise SyntaxError(
                 f"'{colorstr('red', 'bold', a)}' is a valid YOLO argument but is missing an '=' sign "
@@ -1006,9 +1121,9 @@ def entrypoint(debug: str = "") -> None:
 
         model = YOLO(model, task=task)
         if "yoloe" in stem or "world" in stem:
-            cls_list = overrides.pop("classes", DEFAULT_CFG.classes)
-            if cls_list is not None and isinstance(cls_list, str):
-                model.set_classes(cls_list.split(","))  # convert "person, bus" -> ['person', ' bus'].
+            cls_list = overrides.get("classes", DEFAULT_CFG.classes)
+            if isinstance(cls_list, str):  # text prompts, i.e. "person, bus" -> ['person', 'bus']
+                model.set_classes([c.strip() for c in overrides.pop("classes", cls_list).split(",")])
     # Task Update
     if task != model.task:
         if task:
@@ -1025,7 +1140,7 @@ def entrypoint(debug: str = "") -> None:
         )
         LOGGER.warning(f"'source' argument is missing. Using default 'source={overrides['source']}'.")
     elif mode in {"train", "val"}:
-        if "data" not in overrides and "resume" not in overrides:
+        if overrides.get("data") is None and not overrides.get("resume"):
             overrides["data"] = DEFAULT_CFG.data or TASK2DATA.get(task or DEFAULT_CFG.task, DEFAULT_CFG.data)
             LOGGER.warning(f"'data' argument is missing. Using default 'data={overrides['data']}'.")
     elif mode == "export":
@@ -1054,9 +1169,6 @@ def copy_default_cfg() -> None:
 
     Examples:
         >>> copy_default_cfg()
-        # Output: default.yaml copied to /path/to/current/directory/default_copy.yaml
-        # Example YOLO command with this new custom cfg:
-        #   yolo cfg='/path/to/current/directory/default_copy.yaml' imgsz=320 batch=8
 
     Notes:
         - The new configuration file is created in the current working directory.

@@ -116,22 +116,25 @@ class DeepOCSortTrack(OCSortTrack):
         """
         if not stracks:
             return
-        multi_mean = np.asarray([st.mean.copy() for st in stracks])
+        multi_mean = np.asarray([st.mean for st in stracks])
         multi_covariance = np.asarray([st.covariance for st in stracks])
 
         R = H[:2, :2]
         t = H[:2, 2]
 
         # Build 8x8 transform: rotate (x,y) and (vx,vy), identity for (a,h) and (va,vh)
-        R8x8 = np.eye(8, dtype=np.float32)
+        R8x8 = np.eye(8)  # float64 holds any homography exactly; a narrower one would round the float64 methods
         R8x8[:2, :2] = R  # rotate position (x, y)
         R8x8[4:6, 4:6] = R  # rotate velocity (vx, vy)
         # indices 2,3 (a,h) and 6,7 (va,vh) remain identity
 
+        multi_mean = np.matmul(R8x8, multi_mean[..., None])[..., 0]
+        multi_mean[:, :2] += t
+        # Keep the right operand C-contiguous, as the `utils.stracks` sibling does: an F-contiguous one sends matmul
+        # into BLAS's transposed-gemm kernel, which on macOS Accelerate leaves FP-exception flags set even for finite
+        # inputs, and numpy then reports spurious divide-by-zero RuntimeWarnings.
+        multi_covariance = np.matmul(np.matmul(R8x8, multi_covariance), np.ascontiguousarray(R8x8.T))
         for i, (mean, cov) in enumerate(zip(multi_mean, multi_covariance)):
-            mean = R8x8.dot(mean)
-            mean[:2] += t
-            cov = R8x8.dot(cov).dot(R8x8.transpose())
             stracks[i].mean = mean
             stracks[i].covariance = cov
 
@@ -139,7 +142,7 @@ class DeepOCSortTrack(OCSortTrack):
             if stracks[i].last_observation[0] >= 0:
                 obs = stracks[i].last_observation
                 # Transform xyxy observation centers
-                cx, cy = (obs[0] + obs[2]) / 2, (obs[1] + obs[3]) / 2
+                cx, cy = DeepOCSortTrack._xyxy_center(obs)
                 w, h = obs[2] - obs[0], obs[3] - obs[1]
                 new_c = R @ np.array([cx, cy]) + t
                 stracks[i].last_observation = np.array(
@@ -180,7 +183,9 @@ class DeepOCSORT(OCSORT):
         self.appearance_thresh = getattr(args, "appearance_thresh", 0.75)
         self.alpha_fixed_emb = getattr(args, "alpha_fixed_emb", 0.95)
 
-        self.encoder = build_encoder(getattr(args, "with_reid", False), getattr(args, "model", "auto"))
+        self.encoder = build_encoder(
+            getattr(args, "with_reid", False), getattr(args, "model", "auto"), getattr(args, "device", None)
+        )
 
     def init_track(self, results, img: np.ndarray | None = None) -> list[DeepOCSortTrack]:
         """Build `DeepOCSortTrack` instances, attaching ReID features when enabled.
@@ -222,20 +227,6 @@ class DeepOCSORT(OCSORT):
             for (xywh, s, c) in zip(bboxes, results.conf, results.cls)
         ]
 
-    def _input_for(self, img: np.ndarray | None, feats: np.ndarray | None, mask: np.ndarray) -> np.ndarray | None:
-        """Return what `init_track` should receive.
-
-        For `model="auto"` (native-features mode) the encoder iterates a per-detection feature
-        tensor, so we must hand it `feats[mask]`. If the upstream pipeline didn't populate
-        `feats` (e.g. user-supplied detections), return None so `init_track` falls back
-        to the no-encoding path instead of feeding a BGR frame into the auto encoder. For
-        external ReID models, `init_track` always wants the BGR frame.
-        """
-        use_native = self.encoder is not None and getattr(self.args, "model", "auto") == "auto"
-        if use_native:
-            return feats[mask] if (feats is not None and len(feats)) else None
-        return img
-
     def _pre_first_associate(
         self,
         strack_pool: list[DeepOCSortTrack],
@@ -244,7 +235,7 @@ class DeepOCSORT(OCSORT):
         results_high: Any,
     ) -> None:
         """Apply GMC warp to Kalman state before first-stage association."""
-        if img is None:
+        if img is None or self.gmc.method is None:
             return
         try:
             warp = self.gmc.apply(img, results_high.xyxy if len(results_high) else np.empty((0, 4)))

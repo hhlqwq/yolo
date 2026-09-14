@@ -8,6 +8,9 @@ import os
 import time
 import urllib
 from dataclasses import dataclass
+from functools import partial
+from io import BytesIO
+from multiprocessing.pool import ThreadPool
 from pathlib import Path
 from threading import Thread
 from typing import Any
@@ -18,9 +21,9 @@ import torch
 from PIL import Image, ImageOps
 
 from ultralytics.data.utils import FORMATS_HELP_MSG, IMG_FORMATS, VID_FORMATS
-from ultralytics.utils import IS_COLAB, IS_KAGGLE, LOGGER, ops
+from ultralytics.utils import IS_COLAB, IS_KAGGLE, LOGGER, NUM_THREADS, ops
 from ultralytics.utils.checks import check_requirements
-from ultralytics.utils.patches import imread
+from ultralytics.utils.patches import PIL_FALLBACK_SUFFIXES, imread
 
 
 @dataclass
@@ -164,13 +167,12 @@ class LoadStreams:
                 cap.grab()  # .read() = .grab() followed by .retrieve()
                 if n % self.vid_stride == 0:
                     success, im = cap.retrieve()
-                    im = (
-                        cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)[..., None] if self.cv2_flag == cv2.IMREAD_GRAYSCALE else im
-                    )
-                    if not success:
+                    if not success or im is None:
                         im = np.zeros(self.shape[i], dtype=np.uint8)
                         LOGGER.warning("Video stream unresponsive, please check your IP camera connection.")
                         cap.open(stream)  # re-open stream if signal was lost
+                    elif self.cv2_flag == cv2.IMREAD_GRAYSCALE:
+                        im = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)[..., None]
                     if self.buffer:
                         self.imgs[i].append(im)
                     else:
@@ -427,12 +429,9 @@ class LoadImagesAndVideos:
 
                 if success:
                     success, im0 = self.cap.retrieve()
-                    im0 = (
-                        cv2.cvtColor(im0, cv2.COLOR_BGR2GRAY)[..., None]
-                        if self.cv2_flag == cv2.IMREAD_GRAYSCALE
-                        else im0
-                    )
-                    if success:
+                    if success and im0 is not None:
+                        if self.cv2_flag == cv2.IMREAD_GRAYSCALE:
+                            im0 = cv2.cvtColor(im0, cv2.COLOR_BGR2GRAY)[..., None]
                         self.frame += 1
                         paths.append(path)
                         imgs.append(im0)
@@ -450,18 +449,35 @@ class LoadImagesAndVideos:
             else:
                 # Handle image files
                 self.mode = "image"
+                if self.bs >= 8 and NUM_THREADS > 1 and (n := min(self.bs - len(imgs), self.ni - self.count)) >= 8:
+                    image_paths = self.files[self.count : self.count + n]
+                    # Keep fallback formats serial: their lazy PIL plugin registration is not thread-safe.
+                    if not any(Path(x).suffix.lower() in PIL_FALLBACK_SUFFIXES for x in image_paths):
+                        with ThreadPool(min(n, NUM_THREADS)) as pool:
+                            decoded = pool.map(partial(imread, flags=self.cv2_flag), image_paths)
+                        for i, (image_path, im0) in enumerate(zip(image_paths, decoded)):
+                            self._append_image(paths, imgs, info, image_path, im0, self.count + i + 1)
+                        self.count += n  # move to the next batch of files
+                        if self.count >= self.ni and imgs:  # flush images before starting videos
+                            break
+                        continue
+
                 im0 = imread(path, flags=self.cv2_flag)  # BGR
-                if im0 is None:
-                    LOGGER.warning(f"Image Read Error {path}")
-                else:
-                    paths.append(path)
-                    imgs.append(im0)
-                    info.append(f"image {self.count + 1}/{self.nf} {path}: ")
+                self._append_image(paths, imgs, info, path, im0, self.count + 1)
                 self.count += 1  # move to the next file
-                if self.count >= self.ni:  # end of image list
+                if self.count >= self.ni and imgs:  # end of image list, flush only a non-empty batch
                     break
 
         return paths, imgs, info
+
+    def _append_image(self, paths: list, imgs: list, info: list, path: str, im0: np.ndarray | None, idx: int):
+        """Append a decoded image to the batch lists, or warn and skip it if decoding failed."""
+        if im0 is None:
+            LOGGER.warning(f"Image Read Error {path}")
+        else:
+            paths.append(path)
+            imgs.append(im0)
+            info.append(f"image {idx}/{self.nf} {path}: ")
 
     def _new_video(self, path: str):
         """Create a new video capture object for the given path and initialize video-related attributes."""
@@ -512,31 +528,52 @@ class LoadPilAndNumpy:
         """
         if not isinstance(im0, list):
             im0 = [im0]
+        if not im0:  # an empty batch otherwise fails unnamed inside np.stack in Predictor.preprocess
+            raise FileNotFoundError("No images found in source, predict requires at least one image.")
         # use `image{i}.jpg` when Image.filename returns an empty path.
         self.paths = [getattr(im, "filename", "") or f"image{i}.jpg" for i, im in enumerate(im0)]
-        pil_flag = "L" if channels == 1 else "RGB"  # grayscale or RGB
-        self.im0 = [self._single_check(im, pil_flag) for im in im0]
+        self.im0 = [self._single_check(im, channels) for im in im0]
         self.mode = "image"
         self.bs = len(self.im0)
         self.count = 0
 
     @staticmethod
-    def _single_check(im: Image.Image | np.ndarray, flag: str = "RGB") -> np.ndarray:
-        """Validate and format an image to a NumPy array.
+    def _single_check(im: Image.Image | np.ndarray, channels: int = 3) -> np.ndarray:
+        """Validate an image and normalize its channel count.
 
         Notes:
             - PIL inputs are converted to NumPy and returned in OpenCV-compatible BGR order for color images.
-            - NumPy inputs are returned as-is (no channel-order conversion is applied).
+            - NumPy color inputs are assumed to use OpenCV-compatible BGR order.
         """
-        assert isinstance(im, (Image.Image, np.ndarray)), f"Expected PIL/np.ndarray image type, but got {type(im)}"
-        if isinstance(im, Image.Image):
-            im = np.asarray(im.convert(flag))
-            # Add a new axis if grayscale; convert RGB -> BGR for OpenCV compatibility.
-            im = im[..., None] if flag == "L" else im[..., ::-1]
-            im = np.ascontiguousarray(im)  # contiguous
-        elif im.ndim == 2:  # grayscale in numpy form
-            im = im[..., None]
-        return im
+        if not isinstance(im, (Image.Image, np.ndarray)):
+            raise TypeError(f"Expected PIL/np.ndarray image type, but got {type(im)}")
+        pil = isinstance(im, Image.Image)
+        if pil:
+            flag = "L" if channels == 1 else "RGB"
+            im = np.asarray(im if im.mode == flag else im.convert(flag))  # convert() copies even when mode matches
+            if flag == "L":
+                im = im[..., None]
+        im = np.atleast_3d(im)
+        # Both routes validate here: a zero dimension divides by zero in LetterBox, and a batched array reads
+        # shape[2] as a channel count it is not. Raised rather than asserted so `python -O` keeps the check, and
+        # ahead of the cvtColor calls, which assert on an empty input instead of raising this message.
+        if im.ndim != 3 or not all(im.shape):
+            raise ValueError(f"Expected a single (H, W, C) image, but got array of shape {im.shape}")
+        if pil:
+            return im if channels == 1 else cv2.cvtColor(im, cv2.COLOR_RGB2BGR)
+        c = im.shape[2]
+        if c == channels:
+            return im
+        if c == 2:  # gray + alpha
+            im, c = im[..., :1], 1
+        u8 = im.dtype == np.uint8  # cvtColor rejects dtypes NumPy indexing accepts, float64 among them
+        if c == 1:
+            if u8 and channels == 3:
+                return cv2.cvtColor(im[..., 0], cv2.COLOR_GRAY2BGR)
+            return np.repeat(im, channels, axis=2)
+        if channels == 1:
+            return cv2.cvtColor(im, cv2.COLOR_BGRA2GRAY if c == 4 else cv2.COLOR_BGR2GRAY)[..., None]
+        return cv2.cvtColor(im, cv2.COLOR_BGRA2BGR) if u8 and c == 4 else np.ascontiguousarray(im[..., :3])
 
     def __len__(self) -> int:
         """Return the length of the 'im0' attribute, representing the number of loaded images."""
@@ -602,9 +639,9 @@ class LoadTensor:
                 raise ValueError(s)
             LOGGER.warning(s)
             im = im.unsqueeze(0)
-        if im.shape[2] % stride or im.shape[3] % stride:
-            raise ValueError(s)
-        if im.max() > 1.0 + torch.finfo(im.dtype).eps:  # torch.float32 eps is 1.2e-07
+        if not all(im.shape) or im.shape[2] % stride or im.shape[3] % stride:
+            raise ValueError(s)  # a zero dimension reaches im.max() below on an empty tensor
+        if im.max() > 1.0 + (torch.finfo(im.dtype).eps if im.is_floating_point() else 0):
             LOGGER.warning(
                 f"torch.Tensor inputs should be normalized 0.0-1.0 but max value is {im.max()}. Dividing input by 255."
             )
@@ -634,9 +671,15 @@ def autocast_list(source: list[Any]) -> list[Image.Image | np.ndarray]:
     files = []
     for im in source:
         if isinstance(im, (str, Path)):  # filename or uri
-            files.append(
-                ImageOps.exif_transpose(Image.open(urllib.request.urlopen(im) if str(im).startswith("http") else im))
-            )
+            if str(im).startswith("http"):  # requests follows HTTP 308 redirects that urllib lacks pre-3.11
+                import requests  # scoped as slow import
+
+                im = BytesIO(requests.get(im).content)
+            im = Image.open(im)
+            filename = im.filename
+            im = ImageOps.exif_transpose(im)
+            im.filename = filename
+            files.append(im)
         elif isinstance(im, (Image.Image, np.ndarray)):  # PIL or np Image
             files.append(im)
         else:

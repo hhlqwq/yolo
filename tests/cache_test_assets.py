@@ -31,6 +31,10 @@ COMMON_WEIGHTS = [
     "yolov8s-worldv2.pt",
     "yoloe-11s-seg.pt",
     "yoloe-11s-seg-pf.pt",
+    "yolo26s.pt",
+    "yolo26s-seg.pt",
+    "yolo26s-pose.pt",
+    "yolo26s-obb.pt",
 ]
 
 SLOW_WEIGHTS = [
@@ -84,7 +88,7 @@ def cache_solution_assets() -> None:
 
 def cache_clip_model() -> None:
     """Download the CLIP text encoder before xdist workers can race on the shared cache file."""
-    if IS_RASPBERRYPI or checks.IS_PYTHON_3_12 or (checks.IS_PYTHON_3_8 and LINUX and ARM64):
+    if IS_RASPBERRYPI or (checks.IS_PYTHON_3_8 and LINUX and ARM64):
         return
 
     LOGGER.info("[cache] Downloading CLIP text encoder ...")
